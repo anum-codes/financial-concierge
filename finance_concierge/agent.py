@@ -78,17 +78,20 @@ def redact_pii_node(ctx: Any, node_input: str) -> str:
     # Redact email addresses
     email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
     text = re.sub(email_pattern, '[REDACTED_EMAIL]', node_input)
-    
-    # Redact phone numbers (e.g. +1-123-456-7890, 123-456-7890)
-    phone_pattern = r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'
-    text = re.sub(phone_pattern, '[REDACTED_PHONE]', text)
-    
-    # Redact credit card numbers (13-16 digits with potential spaces/dashes)
-    cc_pattern = r'\b(?:\d[ -]*?){13,16}\b'
+
+    # Redact credit card numbers FIRST (4 groups of 4 digits separated by spaces or dashes)
+    # Must run before phone so the broad phone regex doesn't consume 3 of the 4 groups first.
+    cc_pattern = r'\b\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}\b'
     text = re.sub(cc_pattern, '[REDACTED_CARD]', text)
-    
+
+    # Redact phone numbers – handles US (3+3+4), UK (3+4+4), international (+44 20 …)
+    # Requires at least one separator between digit groups to avoid eating bare numbers.
+    phone_pattern = r'(?:\+?\d{1,3}[\s.-])?\(?\d{2,4}\)?[\s.-]\d{3,4}[\s.-]\d{3,4}'
+    text = re.sub(phone_pattern, '[REDACTED_PHONE]', text)
+
     ctx.state['query'] = text
     return text
+
 
 # 3. Intent Classification Orchestrator Agent
 orchestrator_agent = Agent(
