@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest.mock import MagicMock
 from finance_concierge.agent import redact_pii_node, router, transaction_classifier, budget_analyst, alert_agent, report_generator, OrchestratorOutput, StubOutput
 
@@ -46,6 +47,7 @@ class TestFinanceConcierge(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.intent, "TransactionClassifier")
 
     async def test_transaction_classifier(self):
+        from unittest.mock import AsyncMock
         ctx = MagicMock()
         ctx.state = {'query': "spent 50 dollars on lunch"}
         
@@ -57,10 +59,7 @@ class TestFinanceConcierge(unittest.IsolatedAsyncioTestCase):
             date="2026-06-26"
         )
         
-        async def mock_run_node(agent, node_input):
-            return mock_result
-            
-        ctx.run_node = mock_run_node
+        ctx.run_node = AsyncMock(return_value=mock_result)
         
         tc_res = await transaction_classifier._func(ctx)
         self.assertEqual(tc_res.agent, "TransactionClassifier")
@@ -70,20 +69,100 @@ class TestFinanceConcierge(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tc_res.date, "2026-06-26")
         self.assertEqual(tc_res.status, "success")
 
-    def test_subagent_stubs(self):
+    async def test_budget_analyst(self):
+        from unittest.mock import AsyncMock, patch
+        ctx = MagicMock()
+        ctx.state = {'query': "how much is my food budget"}
+        
+        from finance_concierge.agent import BudgetAnalystCategoryResult
+        mock_category = BudgetAnalystCategoryResult(category="Food")
+        ctx.run_node = AsyncMock(return_value=mock_category)
+        
+        with patch('finance_concierge.agent.get_budgets_and_spending') as mock_get:
+            mock_get.return_value = ({"Food": 200.0, "Other": 50.0}, {"Food": 120.0, "Other": 10.0})
+            
+            res = await budget_analyst._func(ctx)
+            self.assertEqual(res.agent, "BudgetAnalyst")
+            self.assertEqual(res.category, "Food")
+            self.assertEqual(res.budget, 200.0)
+            self.assertEqual(res.spent, 120.0)
+            self.assertEqual(res.remaining, 80.0)
+            self.assertEqual(res.percentage_used, 60.0)
+            self.assertEqual(res.status, "under_budget")
+
+    async def test_alert_agent(self):
+        from unittest.mock import patch
         ctx = MagicMock()
         
-        ba_res = budget_analyst._func(ctx)
-        self.assertEqual(ba_res.agent, "BudgetAnalyst")
-        self.assertEqual(ba_res.status, "stub")
+        with patch('finance_concierge.agent.get_budgets_and_spending') as mock_get:
+            # Food spent 170/200 = 85% (warning), Shopping spent 200/150 = 133.3% (over_budget)
+            mock_get.return_value = (
+                {"Food": 200.0, "Shopping": 150.0, "Bills": 100.0},
+                {"Food": 170.0, "Shopping": 200.0, "Bills": 50.0}
+            )
+            
+            res = await alert_agent._func(ctx)
+            self.assertEqual(res.agent, "AlertAgent")
+            self.assertEqual(res.total_alerts, 2)
+            self.assertEqual(res.alerts[0].category, "Shopping")
+            self.assertEqual(res.alerts[0].severity, "over_budget")
+            self.assertEqual(res.alerts[1].category, "Food")
+            self.assertEqual(res.alerts[1].severity, "warning")
+
+    async def test_report_generator(self):
+        from unittest.mock import patch
+        ctx = MagicMock()
         
-        aa_res = alert_agent._func(ctx)
-        self.assertEqual(aa_res.agent, "AlertAgent")
-        self.assertEqual(aa_res.status, "stub")
+        with patch('finance_concierge.agent.get_budgets_and_spending') as mock_get:
+            mock_get.return_value = (
+                {"Food": 200.0, "Shopping": 150.0},
+                {"Food": 120.0, "Shopping": 200.0}
+            )
+            
+            res = await report_generator._func(ctx)
+            self.assertEqual(res.agent, "ReportGenerator")
+            self.assertEqual(res.total_budget, 350.0)
+            self.assertEqual(res.total_spent, 320.0)
+            self.assertEqual(res.total_remaining, 30.0)
+            self.assertEqual(res.savings_rate, 8.57)
+            self.assertEqual(res.over_budget_categories, ["Shopping"])
+            self.assertEqual(res.under_budget_categories, ["Food"])
+
+    async def test_get_budgets_and_spending_success(self):
+        from unittest.mock import AsyncMock, patch
+        from mcp.types import CallToolResult, TextContent
         
-        rg_res = report_generator._func(ctx)
-        self.assertEqual(rg_res.agent, "ReportGenerator")
-        self.assertEqual(rg_res.status, "stub")
+        mock_result = CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "status": "success",
+                        "categories": [
+                            {"category": "Food", "budget": 500.0, "spent": 100.0},
+                            {"category": "Bills", "budget": 300.0, "spent": 300.0}
+                        ]
+                    })
+                )
+            ]
+        )
+        
+        with patch('finance_concierge.agent.toolset._execute_with_session', new_callable=AsyncMock) as mock_exec:
+            mock_exec.return_value = mock_result
+            from finance_concierge.agent import get_budgets_and_spending
+            budgets, spending = await get_budgets_and_spending()
+            self.assertEqual(budgets["Food"], 500.0)
+            self.assertEqual(spending["Food"], 100.0)
+            self.assertEqual(budgets["Bills"], 300.0)
+            self.assertEqual(spending["Bills"], 300.0)
+
+    async def test_get_budgets_and_spending_fallback(self):
+        from unittest.mock import AsyncMock, patch
+        with patch('finance_concierge.agent.toolset._execute_with_session', new_callable=AsyncMock) as mock_exec:
+            mock_exec.side_effect = Exception("Connection refused")
+            from finance_concierge.agent import get_budgets_and_spending, FALLBACK_MONTHLY_BUDGETS
+            budgets, spending = await get_budgets_and_spending()
+            self.assertEqual(budgets, FALLBACK_MONTHLY_BUDGETS)
 
 if __name__ == '__main__':
     unittest.main()

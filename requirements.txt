@@ -1,0 +1,14 @@
+# Core ADK
+google-adk
+
+# Google Sheets integration (used by mcp_server.py)
+gspread>=6.0.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+
+# MCP protocol
+mcp>=1.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0

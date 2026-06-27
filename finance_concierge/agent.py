@@ -1,10 +1,18 @@
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
 import re
 import json
 import datetime
+import sys
+import os
 from typing import Any
 from google.adk.agents.llm_agent import Agent
 from google.adk.workflow import Workflow, START, node
 from pydantic import BaseModel, Field
+from mcp import StdioServerParameters
+from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams
 
 # 1. Structured Output Schemas
 class OrchestratorOutput(BaseModel):
@@ -155,15 +163,57 @@ async def transaction_classifier(ctx: Any) -> TransactionClassifierOutput:
 
 # ── BudgetAnalyst ──────────────────────────────────────────────────────────
 
-MONTHLY_BUDGETS: dict[str, float] = {
+# Fallback values if MCP connection fails
+FALLBACK_MONTHLY_BUDGETS: dict[str, float] = {
     "Food": 200, "Transport": 100, "Shopping": 150,
     "Bills": 300, "Health": 100, "Entertainment": 80, "Other": 50,
 }
 
-CURRENT_SPENDING: dict[str, float] = {
+FALLBACK_CURRENT_SPENDING: dict[str, float] = {
     "Food": 120, "Transport": 45, "Shopping": 200,
     "Bills": 300, "Health": 20, "Entertainment": 60, "Other": 10,
 }
+
+# MCP Client initialization
+mcp_server_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "mcp_server.py"))
+
+toolset = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command=sys.executable,
+            args=[mcp_server_path],
+            env=os.environ.copy()
+        ),
+        timeout=10.0
+    )
+)
+
+async def get_budgets_and_spending() -> tuple[dict[str, float], dict[str, float]]:
+    """Fetches real budget and spending data from Google Sheets via MCP, falling back to hardcoded values if it fails."""
+    try:
+        res = await toolset._execute_with_session(
+            lambda session: session.call_tool("get_budget_summary", arguments={}),
+            "Failed to call get_budget_summary"
+        )
+        if not res or not res.content:
+            raise ValueError("Empty response from get_budget_summary")
+        data = json.loads(res.content[0].text)
+        
+        # Check if get_budget_summary returned success or is structured correctly
+        if isinstance(data, dict) and data.get("status") == "success":
+            monthly_budgets = {}
+            current_spending = {}
+            for cat_info in data.get("categories", []):
+                cat = cat_info.get("category")
+                if cat:
+                    monthly_budgets[cat] = float(cat_info.get("budget", 0))
+                    current_spending[cat] = float(cat_info.get("spent", 0))
+            if monthly_budgets:
+                return monthly_budgets, current_spending
+        raise ValueError(f"Invalid data or status in get_budget_summary: {data}")
+    except Exception as e:
+        print(f"Warning: Failed to load data from MCP server: {e}. Falling back to hardcoded values.")
+        return FALLBACK_MONTHLY_BUDGETS, FALLBACK_CURRENT_SPENDING
 
 budget_analyst_agent = Agent(
     name="BudgetAnalystAgent",
@@ -187,13 +237,15 @@ async def budget_analyst(ctx: Any) -> BudgetAnalystOutput:
 
     # Normalise to a known key; fall back to "Other"
     category = category.strip().title()
-    if category not in MONTHLY_BUDGETS:
+    
+    monthly_budgets, current_spending = await get_budgets_and_spending()
+    if category not in monthly_budgets:
         category = "Other"
 
-    budget  = MONTHLY_BUDGETS[category]
-    spent   = CURRENT_SPENDING[category]
+    budget  = monthly_budgets.get(category, 0.0)
+    spent   = current_spending.get(category, 0.0)
     remaining       = budget - spent
-    percentage_used = round(spent / budget * 100, 2)
+    percentage_used = round(spent / budget * 100, 2) if budget else 0.0
     status  = "over_budget" if spent > budget else "under_budget"
 
     output = BudgetAnalystOutput(
@@ -213,14 +265,16 @@ async def budget_analyst(ctx: Any) -> BudgetAnalystOutput:
 # ── AlertAgent ────────────────────────────────────────────────────────────
 
 @node
-def alert_agent(ctx: Any) -> AlertAgentOutput:
+async def alert_agent(ctx: Any) -> AlertAgentOutput:
     """Pure-Python alert scanner: no LLM needed.
     Classifies every category and returns only over_budget / warning items.
     """
     alerts: list[AlertItem] = []
+    
+    monthly_budgets, current_spending = await get_budgets_and_spending()
 
-    for category, budget in MONTHLY_BUDGETS.items():
-        spent = CURRENT_SPENDING.get(category, 0.0)
+    for category, budget in monthly_budgets.items():
+        spent = current_spending.get(category, 0.0)
         percentage_used = round(spent / budget * 100, 2) if budget else 0.0
 
         if spent > budget:
@@ -253,26 +307,28 @@ def alert_agent(ctx: Any) -> AlertAgentOutput:
 # ── ReportGenerator ───────────────────────────────────────────────────
 
 @node
-def report_generator(ctx: Any) -> ReportGeneratorOutput:
+async def report_generator(ctx: Any) -> ReportGeneratorOutput:
     """Pure-Python weekly finance summary report. No LLM needed."""
-    total_budget    = sum(MONTHLY_BUDGETS.values())
-    total_spent     = sum(CURRENT_SPENDING.values())
+    monthly_budgets, current_spending = await get_budgets_and_spending()
+
+    total_budget    = sum(monthly_budgets.values())
+    total_spent     = sum(current_spending.values())
     total_remaining = round(total_budget - total_spent, 2)
     savings_rate    = round(total_remaining / total_budget * 100, 2) if total_budget else 0.0
 
     # Categories where spent > budget, sorted by overspend (descending)
     over_budget_categories = sorted(
-        [cat for cat, bgt in MONTHLY_BUDGETS.items()
-         if CURRENT_SPENDING.get(cat, 0) > bgt],
-        key=lambda cat: CURRENT_SPENDING.get(cat, 0) - MONTHLY_BUDGETS[cat],
+        [cat for cat, bgt in monthly_budgets.items()
+         if current_spending.get(cat, 0) > bgt],
+        key=lambda cat: current_spending.get(cat, 0) - monthly_budgets[cat],
         reverse=True,
     )
 
     # Top-3 categories furthest under budget (highest remaining), excluding over-budget ones
     under_budget_categories = sorted(
-        [cat for cat, bgt in MONTHLY_BUDGETS.items()
-         if CURRENT_SPENDING.get(cat, 0) <= bgt],
-        key=lambda cat: MONTHLY_BUDGETS[cat] - CURRENT_SPENDING.get(cat, 0),
+        [cat for cat, bgt in monthly_budgets.items()
+         if current_spending.get(cat, 0) <= bgt],
+        key=lambda cat: monthly_budgets[cat] - current_spending.get(cat, 0),
         reverse=True,
     )[:3]
 
